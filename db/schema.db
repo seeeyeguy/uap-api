@@ -1,0 +1,84 @@
+-- ============================================================
+-- UAP API Schema
+-- ============================================================
+
+-- Enable UUID generation
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ============================================================
+-- USERS
+-- Synced from Clerk on first login.
+-- Clerk is the source of truth for identity,
+-- Postgres is the source of truth for business data.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS users (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    clerk_id    TEXT        UNIQUE NOT NULL,
+    email       TEXT        UNIQUE NOT NULL,
+    tier        TEXT        NOT NULL DEFAULT 'free' CHECK (tier IN ('free', 'member')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_clerk_id ON users(clerk_id);
+
+-- ============================================================
+-- SUBSCRIPTIONS
+-- Tracks Stripe billing state separately from the user.
+-- Keeping billing in its own table means you can evolve
+-- pricing without touching the users table.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id                      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id                 UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    stripe_customer_id      TEXT        UNIQUE,
+    stripe_subscription_id  TEXT        UNIQUE,
+    status                  TEXT        NOT NULL DEFAULT 'inactive' CHECK (status IN ('active', 'inactive', 'cancelled', 'past_due')),
+    tier                    TEXT        NOT NULL DEFAULT 'free' CHECK (tier IN ('free', 'member')),
+    current_period_end      TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_customer_id ON subscriptions(stripe_customer_id);
+
+-- ============================================================
+-- QUERIES
+-- Full log of every question asked.
+-- cited_doc_ids stores ChromaDB document IDs — no need to
+-- duplicate document data that already lives in Chroma.
+-- Also serves as the foundation for rate limiting by counting
+-- rows per user per time window.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS queries (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    query_text      TEXT        NOT NULL,
+    response_text   TEXT        NOT NULL,
+    cited_doc_ids   TEXT[]      DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_queries_user_id ON queries(user_id);
+CREATE INDEX IF NOT EXISTS idx_queries_created_at ON queries(created_at);
+
+-- ============================================================
+-- UPDATED_AT TRIGGER
+-- Automatically keeps updated_at current on any row update.
+-- ============================================================
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE OR REPLACE TRIGGER subscriptions_updated_at
+    BEFORE UPDATE ON subscriptions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
